@@ -761,11 +761,22 @@ extension ChatSession {
 
                         // Select the token iterator based on speculative decoding configuration.
                         let (genStream, genTask): (AsyncStream<Generation>, Task<Void, Never>)
+                        // KV-cache quantization replaces cache *elements*
+                        // (KVCacheSimple → QuantizedKVCache). The iterator
+                        // sees that through its KVCacheContainer, but this
+                        // session's own kvCache array would keep the stale
+                        // unquantized references — losing everything
+                        // generated after the swap on the next turn. Hold
+                        // the container here and sync back after the pass.
+                        var tokenCacheContainer: KVCacheContainer? = nil
                         func defaultGeneration() throws -> (
                             AsyncStream<Generation>, Task<Void, Never>
                         ) {
+                            let container = KVCacheContainer(
+                                cache: kvCache, model: model, parameters: generateParameters)
+                            tokenCacheContainer = container
                             let iterator = try TokenIterator(
-                                input: input, model: model, cache: kvCache,
+                                input: input, model: model, cacheContainer: container,
                                 parameters: generateParameters)
 
                             return MLXLMCommon.generateTask(
@@ -929,6 +940,14 @@ extension ChatSession {
                         // the case where we broke the loop early as the generation
                         // work may continue (briefly) and use the KVCache
                         await genTask.value
+
+                        // Adopt any element replacements (KV quantization)
+                        // the iterator made through the container, so the
+                        // session's stored cache keeps the full transcript.
+                        if let tokenCacheContainer {
+                            kvCache = tokenCacheContainer.cache
+                            cache = .kvcache(kvCache, draftKVCache: draftKVCache)
+                        }
 
                         // dispatch all tool calls from this generation pass
                         if let toolDispatch, !pendingToolCalls.isEmpty,
