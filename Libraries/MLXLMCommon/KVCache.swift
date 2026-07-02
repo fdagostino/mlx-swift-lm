@@ -797,6 +797,47 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
+/// ``KVCacheSimple`` variant for sliding-window layers: keeps the full history
+/// (always trimmable, temporally ordered) and enforces the window through the
+/// attention mask instead of physically rotating the buffer.
+///
+/// Unlike ``RotatingKVCache``, this cache stays trimmable after the context
+/// exceeds the window, which speculative decoding requires to rewind rejected
+/// draft tokens. The trade-off is that the KV buffer grows with the full
+/// sequence length instead of being capped at the window size.
+public final class SlidingWindowMaskKVCache: KVCacheSimple {
+    public let windowSize: Int
+
+    public init(windowSize: Int) {
+        self.windowSize = windowSize
+        super.init()
+    }
+
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        let w = windowSize ?? self.windowSize
+        // Mirrors the RotatingKVCache.makeMask thresholds, but with the
+        // uncapped offset: the buffer holds the full (offset + n) history, so
+        // the distance-based window must be enforced as soon as any query
+        // could otherwise attend to keys older than the window.
+        if offset + n > w || returnArray {
+            return .array(createCausalMask(n: n, offset: offset, windowSize: w))
+        }
+        return n == 1 ? .none : .causal
+    }
+
+    public override func copy() -> any KVCache {
+        let new = SlidingWindowMaskKVCache(windowSize: windowSize)
+        new.step = self.step
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        return new
+    }
+}
+
 private func resolvedKVQuantizationGroupSize(
     requested: Int,
     keyHeadDim: Int,
@@ -2025,7 +2066,11 @@ public func maybeQuantizeKVCache(
         if let list = cache as? CacheList {
             return list.children.contains(where: isQuantizable)
         }
+        // SlidingWindowMaskKVCache must keep its makeMask override — quantizing
+        // it would drop the window enforcement (parity with RotatingKVCache,
+        // which is never quantized either).
         return cache is KVCacheSimple
+            && !(cache is SlidingWindowMaskKVCache)
             && !(cache is QuantizedKVCache)
             && cache.offset > quantizedKVStart
     }
@@ -2057,10 +2102,14 @@ public func maybeQuantizeKVCache(
     for i in 0 ..< cache.count {
         if let list = cache[i] as? CacheList {
             list.mapChildren { child in
-                guard let simpleCache = child as? KVCacheSimple else { return child }
+                guard let simpleCache = child as? KVCacheSimple,
+                    !(simpleCache is SlidingWindowMaskKVCache)
+                else { return child }
                 return quantize(simpleCache)
             }
-        } else if let simpleCache = cache[i] as? KVCacheSimple {
+        } else if let simpleCache = cache[i] as? KVCacheSimple,
+            !(simpleCache is SlidingWindowMaskKVCache)
+        {
             cache[i] = quantize(simpleCache)
         }
         // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.

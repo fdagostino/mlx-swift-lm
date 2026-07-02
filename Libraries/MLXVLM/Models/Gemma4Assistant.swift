@@ -271,30 +271,24 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
         // Per-layer-type masks; KV tensor shape is [B, H, S, D] so axis -2 = seq.
         let fullKvLen = sharedKV["full_attention"].map { $0.0.dim(-2) } ?? 0
         let slidingKvLen = sharedKV["sliding_attention"].map { $0.0.dim(-2) } ?? 0
-        // Production invariant: the target's sliding-attention KV cache is
-        // capped at `slidingWindow` by `RotatingKVCache(maxSize:keep:)` (see
-        // `Gemma4TextLanguageModel.newCache`), so `slidingKvLen` is always
-        // bounded by `textCfg.slidingWindow`. That bound is what makes the
-        // bidirectional sliding-window mask's early-exit branch
-        // (`windowSize >= kvLen` → all-zeros mask) fire on every production
-        // call. If this invariant ever changes — e.g. a different cache
-        // policy that lets the sliding KV grow past `slidingWindow` — the
-        // mask helper's `windowSize >= kvLen` branch would NOT fire, and the
-        // helper's non-degenerate path produces an absolute-position mask
-        // that does not match the distance-from-`queryOffset` mask the
-        // drafter actually needs. Catching the violation here is much louder
-        // than a silently wrong attention pattern downstream.
-        precondition(
-            slidingKvLen <= textCfg.slidingWindow,
-            "sliding KV length \(slidingKvLen) exceeds slidingWindow \(textCfg.slidingWindow) — "
-                + "the production invariant that lets the bidirectional sliding-window "
-                + "mask early-exit to all-zeros has been violated"
+        // Production invariant (SlidingWindowMaskKVCache regime, see
+        // `Gemma4TextLanguageModel.newCache`): the shared KV pool is temporally
+        // ordered (kv index == absolute position) and ends at or before the
+        // draft query position — otherwise the distance arithmetic of the
+        // offset-aware sliding mask below would be meaningless. The pool may
+        // grow past `slidingWindow`; the window is enforced per distance from
+        // `queryOffset`, mirroring the target's masked sliding attention.
+        assert(
+            slidingKvLen <= queryOffset && fullKvLen <= queryOffset,
+            "sharedKV pool (sliding \(slidingKvLen) / full \(fullKvLen)) reaches past "
+                + "queryOffset \(queryOffset) — pool must be temporally ordered and end "
+                + "at or before the draft query position"
         )
         let fullMask = createBidirectionalMask(
             queryLen: queryLen, kvLen: fullKvLen, dtype: h.dtype)
         let slidingMask = createBidirectionalSlidingWindowMask(
             queryLen: queryLen, kvLen: slidingKvLen,
-            windowSize: textCfg.slidingWindow, dtype: h.dtype)
+            windowSize: textCfg.slidingWindow, queryOffset: queryOffset, dtype: h.dtype)
 
         for layer in model.layers {
             guard let kvPair = sharedKV[layer.layerType] else {

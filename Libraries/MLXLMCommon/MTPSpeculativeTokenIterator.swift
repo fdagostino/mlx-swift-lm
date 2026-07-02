@@ -258,9 +258,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // Invariant: the span the drafter attends over describes exactly the
         // true sequence — the rewind site trims the emitted snapshot in
         // lockstep with the cache. `dim()` is shape metadata (no eval, no GPU
-        // sync). The check stands down if the cache ever leaves the trimmable
-        // regime (post-wrap sliding window), where the rewind machinery
-        // itself no-ops.
+        // sync). With Gemma4's sliding layers on SlidingWindowMaskKVCache the
+        // caches stay trimmable at any offset, so this holds strictly; the
+        // `!canTrimPromptCache` escape hatch only remains for hypothetical
+        // untrimmable cache configurations.
         assert(
             sharedKV.allSatisfy { $0.value.0.dim(-2) == cacheOffset }
                 || !canTrimPromptCache(mainCache),
@@ -350,10 +351,13 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // rejected count, in lockstep. The drafter has no cache of its own,
         // but the verify pass's state emission spans the full verify chunk —
         // stale tail rows must not survive into the next round's draftBlock.
+        // With Gemma4's sliding layers on SlidingWindowMaskKVCache all caches
+        // stay trimmable at any offset, so this rewind is always effective
+        // (the former RotatingKVCache became untrimmable post-wrap, turning
+        // this into a no-op and corrupting subsequent forwards — Bug D).
         // Trimming the snapshot by the amount the cache actually trimmed
-        // keeps the two consistent even if the cache ever reports itself
-        // untrimmable (post-wrap sliding window), where trimPromptCache
-        // no-ops and returns 0.
+        // keeps the two consistent even for hypothetical untrimmable caches,
+        // where trimPromptCache no-ops and returns 0.
         let rejected = numDraft - accepted
         let trimmed = trimPromptCache(mainCache, numTokens: rejected)
         trimSharedKVState(&mainState, numTokens: trimmed)

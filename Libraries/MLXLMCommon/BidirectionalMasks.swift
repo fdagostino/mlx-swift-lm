@@ -38,13 +38,12 @@ public func createBidirectionalMask(
 ///
 /// Contract for the non-degenerate path (`kvLen > windowSize`): the mask
 /// is built from an absolute-position predicate (`kIdx < windowSize`), NOT
-/// a distance-from-`queryOffset` predicate. Callers that need
-/// distance-based windowing around a non-zero query offset (e.g. an mlx-vlm-
-/// style `|q_idx - k_idx| < windowSize` mask) must build the mask inline
-/// rather than calling this helper. MTP production callers don't hit this
-/// path because the target's sliding-attention cache cap keeps `kvLen` at
-/// or under `windowSize`; `Gemma4AssistantDraftModel.forwardHidden` enforces
-/// the invariant with a precondition before calling here.
+/// a distance-from-`queryOffset` predicate. This variant is kept for the
+/// pinned fixture tests; production MTP drafting uses the offset-aware
+/// `createBidirectionalSlidingWindowMask(queryLen:kvLen:windowSize:queryOffset:dtype:)`
+/// below, which windows by distance from the query position and therefore
+/// stays correct when the (temporally ordered) KV pool grows beyond
+/// `windowSize`.
 ///
 /// - Parameters:
 ///   - queryLen: number of query tokens
@@ -69,5 +68,44 @@ public func createBidirectionalSlidingWindowMask(
         MLXArray(-Float.infinity, dtype: dtype)
     )
     // Broadcast the row across queryLen rows.
+    return broadcast(row[.newAxis, 0...], to: [queryLen, kvLen])
+}
+
+/// Offset-aware bidirectional sliding-window mask for MTP drafting over a
+/// temporally ordered KV pool (kv index `j` == absolute position `j`).
+///
+/// All draft queries sit at the single constant position `queryOffset`
+/// (`draftBlock` reuses the same offset for every drafted token), so the
+/// window is a distance predicate from that one position: attend iff
+/// `j >= queryOffset - windowSize`. The inclusive bound replicates exactly
+/// the content of the former `RotatingKVCache` pool (the last `windowSize`
+/// tokens before the query) and degenerates to the all-zeros mask whenever
+/// the pool is shorter than the window — including every fixture case of the
+/// absolute-position variant above.
+///
+/// - Parameters:
+///   - queryLen: number of query tokens
+///   - kvLen: total kv positions in the (temporally ordered) pool
+///   - windowSize: sliding window size
+///   - queryOffset: absolute position of the draft queries
+///   - dtype: array dtype (must match the queries' dtype)
+/// - Returns: `[queryLen, kvLen]` additive mask.
+public func createBidirectionalSlidingWindowMask(
+    queryLen: Int,
+    kvLen: Int,
+    windowSize: Int,
+    queryOffset: Int,
+    dtype: DType
+) -> MLXArray {
+    let lower = queryOffset - windowSize
+    if lower <= 0 {
+        return MLXArray.zeros([queryLen, kvLen], dtype: dtype)
+    }
+    let kIdx = MLXArray(Int32(0) ..< Int32(kvLen))
+    let row = MLX.where(
+        kIdx .>= Int32(lower),
+        MLXArray(0, dtype: dtype),
+        MLXArray(-Float.infinity, dtype: dtype)
+    )
     return broadcast(row[.newAxis, 0...], to: [queryLen, kvLen])
 }

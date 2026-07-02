@@ -1425,7 +1425,13 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             if layerType == "full_attention" {
                 StandardKVCache()
             } else {
-                RotatingKVCache(maxSize: slidingWindow, keep: 0)
+                // Trimmable full-history cache with the window enforced by the
+                // attention mask: a RotatingKVCache becomes untrimmable once it
+                // wraps, which breaks the speculative-decoding rewind (rejected
+                // draft tokens would stay in the cache and corrupt subsequent
+                // forwards). Keys also stay temporally ordered, which the MTP
+                // drafter's sharedKV consumption relies on.
+                SlidingWindowMaskKVCache(windowSize: slidingWindow)
             }
         }
     }
