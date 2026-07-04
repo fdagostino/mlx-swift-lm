@@ -2079,6 +2079,7 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     private func getInputEmbeddings(
         inputIds: MLXArray,
         pixelValues: MLXArray? = nil,
+        videoPixelValues: MLXArray? = nil,
         audioFeatures: MLXArray? = nil,
         audioMask: MLXArray? = nil
     ) throws -> (MLXArray, MLXArray?) {
@@ -2090,14 +2091,16 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 
         var perLayerInputs: MLXArray? = nil
         if config.textConfiguration.hiddenSizePerLayerInput > 0 {
-            let imageMask = inputIds .== config.imageTokenId
-            let audioTokenMask =
-                if let audioTokenId = config.audioTokenId {
-                    inputIds .== audioTokenId
-                } else {
-                    MLXArray.zeros(like: imageMask)
-                }
-            let textMask = logicalNot(logicalOr(imageMask, audioTokenMask))
+            // Image / video / audio tokens are not text and are excluded from
+            // per-layer inputs (they receive scattered encoder features instead).
+            var multimodalMask = inputIds .== config.imageTokenId
+            if let audioTokenId = config.audioTokenId {
+                multimodalMask = multimodalMask | (inputIds .== audioTokenId)
+            }
+            if let videoTokenId = config.videoTokenId {
+                multimodalMask = multimodalMask | (inputIds .== videoTokenId)
+            }
+            let textMask = logicalNot(multimodalMask)
             let perLayerTokens = MLX.where(textMask, inputIds, MLXArray.zeros(like: inputIds))
             perLayerInputs = languageModel.model.getPerLayerInputs(perLayerTokens)
         }
@@ -2122,6 +2125,31 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                 inputTensor: inputsEmbeds,
                 mask: imageMaskExpanded,
                 source: imageFeatures
+            )
+        }
+
+        // Video frames run through the same vision tower as images; only the
+        // placeholder token id differs (`video_token_id`).
+        if let videoPixelValues, let videoTokenId = config.videoTokenId {
+            var videoFeatures = visionTower(videoPixelValues)
+            videoFeatures = embedVision(videoFeatures)
+            videoFeatures = videoFeatures.asType(inputsEmbeds.dtype)
+
+            let videoMask = inputIds .== videoTokenId
+            let expectedVideoTokens = videoMask.asType(.int32).sum().item(Int.self)
+
+            if expectedVideoTokens != videoFeatures.dim(1) {
+                throw Gemma4Error.multimodalTokenCountMismatch(
+                    kind: "video", featureTokens: videoFeatures.dim(1),
+                    promptTokens: expectedVideoTokens)
+            }
+
+            var videoMaskExpanded = expandedDimensions(videoMask, axis: -1)
+            videoMaskExpanded = broadcast(videoMaskExpanded, to: inputsEmbeds.shape)
+            inputsEmbeds = gemma4MaskedScatter(
+                inputTensor: inputsEmbeds,
+                mask: videoMaskExpanded,
+                source: videoFeatures
             )
         }
 
@@ -2153,10 +2181,13 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         -> PrepareResult
     {
         let convertedCache = cache.map { $0 }
-        if input.image?.pixels != nil || input.audio?.features != nil {
+        if input.image?.pixels != nil || input.video?.pixels != nil
+            || input.audio?.features != nil
+        {
             let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
                 inputIds: input.text.tokens,
                 pixelValues: input.image?.pixels,
+                videoPixelValues: input.video?.pixels,
                 audioFeatures: input.audio?.features,
                 audioMask: input.audio?.mask)
             let result = languageModel(
@@ -2167,7 +2198,7 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                 tokenTypeIds: gemma4TokenTypeIds(
                     inputIds: input.text.tokens,
                     imageTokenId: config.imageTokenId,
-                    videoTokenId: nil,
+                    videoTokenId: config.videoTokenId,
                     audioTokenId: config.audioTokenId)
             )
             return .logits(result)
