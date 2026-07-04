@@ -261,6 +261,65 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertGreaterThan(result.count, targetLength, result)
     }
 
+    /// `ChatSession.mtpSpeculation` end-to-end wiring pin. The mock target is
+    /// a Gemma 3 (no MTP emit hook), so the `MTPSpeculativeTokenIterator`
+    /// must engage sticky passthrough on the first round — generation
+    /// completes, the drafter is never invoked, and the passthrough reason
+    /// reaches the emitted `GenerateCompletionInfo`. Exercises the whole
+    /// ChatSession → iterator → generateTask plumbing without Gemma 4
+    /// weights.
+    func testMTPSpeculationDegradesToPassthroughOnNonMTPModel() async throws {
+        final class NeverCalledDrafter: Module, MTPDrafterModel {
+            func draftBlock(
+                target: any LanguageModel,
+                lastToken: MLXArray,
+                lastHidden: MLXArray,
+                sharedKV: [String: (MLXArray, MLXArray)],
+                queryOffset: Int,
+                blockSize: Int,
+                sampler: any LogitSampler
+            ) -> MLXArray {
+                XCTFail("drafter must not be called when the target emits no MTP state")
+                return MLXArray.zeros([1, blockSize - 1], dtype: .int32)
+            }
+        }
+
+        let session = ChatSession(
+            model(),
+            generateParameters: GenerateParameters(maxTokens: 4, temperature: 0.0)
+        )
+        session.mtpSpeculation = MTPSpeculationConfig(
+            drafter: MTPDrafterContainer(
+                context: MTPDrafterContext(
+                    configuration: ModelConfiguration(id: "test/mtp-drafter", defaultPrompt: ""),
+                    model: NeverCalledDrafter()
+                )
+            ),
+            blockSize: 4
+        )
+
+        var info: GenerateCompletionInfo?
+        var chunks = 0
+        for try await generation in session.streamDetails(
+            to: "hello",
+            role: .user,
+            images: [] as [UserInput.Image],
+            videos: [] as [UserInput.Video]
+        ) {
+            if generation.chunk != nil { chunks += 1 }
+            if let generationInfo = generation.info {
+                info = generationInfo
+            }
+        }
+
+        let completionInfo = try XCTUnwrap(info)
+        XCTAssertNotNil(
+            completionInfo.passthroughReason,
+            "MTP iterator should have engaged sticky passthrough on a non-MTP target")
+        XCTAssertEqual(completionInfo.proposedDraftTokens, 0)
+        XCTAssertGreaterThan(chunks, 0, "generation should still produce output in passthrough")
+    }
+
     func testSpeculativeDecodingMemoryPolicyFallbackUsesDefaultGeneration() async throws {
         let draft = ModelContainer(context: model())
         let session = ChatSession(

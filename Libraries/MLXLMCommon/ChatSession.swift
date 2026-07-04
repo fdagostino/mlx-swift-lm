@@ -118,6 +118,29 @@ public struct SpeculativeDecodingConfig: Sendable {
     }
 }
 
+/// Configuration for MTP (Multi-Token Prediction) speculative decoding in
+/// ``ChatSession``.
+///
+/// Unlike ``SpeculativeDecodingConfig`` — whose draft model is an auxiliary
+/// `LanguageModel` with its own KV cache — an MTP drafter (e.g. the Gemma 4
+/// `*-assistant` checkpoints) shares the target model's K/V and tokenizer and
+/// holds no cache of its own. See ``MTPDrafterModel`` and
+/// ``MTPSpeculativeTokenIterator``.
+public struct MTPSpeculationConfig: Sendable {
+    /// The loaded MTP drafter.
+    public let drafter: MTPDrafterContainer
+
+    /// Total tokens per speculation round (`blockSize - 1` drafted plus the
+    /// bonus token from the previous verify). Mirrors mlx-vlm's
+    /// `draft_block_size`; the published Gemma 4 drafters are trained for 4.
+    public let blockSize: Int
+
+    public init(drafter: MTPDrafterContainer, blockSize: Int = 4) {
+        self.drafter = drafter
+        self.blockSize = blockSize
+    }
+}
+
 /// Simplified API for multi-turn conversations with LLMs and VLMs.
 ///
 /// For example:
@@ -162,6 +185,20 @@ public final class ChatSession {
 
     /// Speculative decoding configuration, nil if disabled.
     public let speculativeDecoding: SpeculativeDecodingConfig?
+
+    /// MTP speculative decoding configuration, nil if disabled.
+    ///
+    /// Unlike ``speculativeDecoding`` (an auxiliary draft `LanguageModel` with
+    /// its own KV cache), an MTP drafter shares the target model's K/V and
+    /// tokenizer and holds no cache of its own — see ``MTPDrafterModel``.
+    /// When both this and ``speculativeDecoding`` are set, MTP wins.
+    ///
+    /// A `var` (unlike ``speculativeDecoding``) so the drafter can finish
+    /// loading in parallel with the first turns of the conversation and be
+    /// attached when ready; the value is captured per `respond`/
+    /// `streamResponse` call, so a mid-stream assignment affects the next
+    /// call, not the in-flight one.
+    public var mtpSpeculation: MTPSpeculationConfig?
 
     /// Initialize the `ChatSession`.
     ///
@@ -578,7 +615,8 @@ public final class ChatSession {
             [
                 model,
                 instructions, processing, tools, toolDispatch,
-                additionalContext, cache, loadedDraftModel, generateParameters, speculativeDecoding
+                additionalContext, cache, loadedDraftModel, generateParameters,
+                speculativeDecoding, mtpSpeculation
             ] in
             do {
                 try await cache.update { cache in
@@ -658,7 +696,34 @@ public final class ChatSession {
                             )
                         }
 
-                        if let speculativeDecoding {
+                        if let mtpSpeculation {
+                            // MTP path: the drafter shares the target's K/V
+                            // and tokenizer and has no cache of its own, so
+                            // there is no draft-KV bookkeeping here. If the
+                            // target cannot emit drafter state (e.g. KV cache
+                            // quantization), the iterator degrades to
+                            // single-token passthrough on its own.
+                            let drafter = await mtpSpeculation.drafter.perform { context in
+                                SendableBox(context.model)
+                            }.consume()
+
+                            let iterator = try MTPSpeculativeTokenIterator(
+                                input: input,
+                                mainModel: model,
+                                drafter: drafter,
+                                mainCache: kvCache,
+                                parameters: generateParameters,
+                                blockSize: mtpSpeculation.blockSize
+                            )
+
+                            (genStream, genTask) = MLXLMCommon.generateTask(
+                                promptTokenCount: input.text.tokens.size,
+                                modelConfiguration: modelConfiguration,
+                                tokenizer: tokenizer,
+                                iterator: iterator,
+                                tools: tools
+                            )
+                        } else if let speculativeDecoding {
                             var shouldFallBackBeforeLoadingDraft = false
                             if let memoryPolicy = speculativeDecoding.memoryPolicy,
                                 let draftModelBytes =
