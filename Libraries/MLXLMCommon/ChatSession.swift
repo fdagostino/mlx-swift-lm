@@ -626,10 +626,13 @@ public final class ChatSession {
                     let tokenizer = await model.tokenizer
                     let modelConfiguration = await model.configuration
 
+                    // Note: the system instructions are prepended only on the
+                    // FIRST call (empty cache). On subsequent calls the KV cache
+                    // already contains the instructions and the prior turns
+                    // (`model.prepare` appends new prompt tokens to the cache),
+                    // so re-sending them would re-prefill the full prefix every
+                    // turn AND duplicate the system prompt in the transcript.
                     var messages: [Chat.Message] = []
-                    if let instructions {
-                        messages.append(.system(instructions))
-                    }
 
                     // prepare the cache, if needed.  note:
                     // this is using the LanguageModel (not Sendable) outside
@@ -654,15 +657,25 @@ public final class ChatSession {
                     case .empty:
                         kvCache = model.newCache(parameters: generateParameters)
                         cache = .kvcache(kvCache, draftKVCache: nil)
+                        if let instructions {
+                            messages.append(.system(instructions))
+                        }
 
                     case .kvcache(let array, let storedDraftCache):
+                        // Cache already holds the instructions + prior turns;
+                        // only the new messages get tokenized and prefilled.
                         kvCache = array
                         draftKVCache = storedDraftCache
 
                     case .history(let history):
-                        // the KVCache is represented by a chat history
+                        // the KVCache is represented by a chat history (which,
+                        // per the initializer docs, already includes the system
+                        // prompt when one was used).
                         kvCache = model.newCache(parameters: generateParameters)
                         cache = .kvcache(kvCache, draftKVCache: nil)
+                        if let instructions, !history.contains(where: { $0.role == .system }) {
+                            messages.append(.system(instructions))
+                        }
                         messages.append(contentsOf: history)
                     }
 
