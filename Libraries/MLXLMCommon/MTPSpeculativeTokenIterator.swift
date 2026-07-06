@@ -129,7 +129,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         self.sampler = parameters.sampler()
         try components.validate(parameters: parameters)
-        self.processor = components.logitProcessor(parameters: parameters)
+        self.processor = components.logitProcessor(parameters: parameters, model: mainModel)
 
         self.maxTokens = parameters.maxTokens
         // A round presents `blockSize` positions at once, and a sliding layer can only show a

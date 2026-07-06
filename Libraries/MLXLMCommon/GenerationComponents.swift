@@ -121,4 +121,23 @@ public struct GenerationComponents: Sendable {
             return ChainedLogitProcessor(processors: [penalty, custom])
         }
     }
+
+    /// As ``logitProcessor(parameters:)``, additionally masking the token ids
+    /// the model declares through ``SuppressedTokensProviding``.
+    ///
+    /// Suppression runs last so that no processor composed before it can
+    /// reintroduce a masked id -- for multimodal placeholder tokens, emitting
+    /// one is never valid output.
+    public func logitProcessor(
+        parameters: GenerateParameters, model: any LanguageModel
+    ) -> LogitProcessor? {
+        let base = logitProcessor(parameters: parameters)
+        guard let provider = model as? SuppressedTokensProviding,
+            let suppressor = SuppressTokensProcessor(tokenIds: provider.suppressedTokenIds)
+        else {
+            return base
+        }
+        guard let base else { return suppressor }
+        return ChainedLogitProcessor(processors: [base, suppressor])
+    }
 }
