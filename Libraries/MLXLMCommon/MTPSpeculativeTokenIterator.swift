@@ -126,7 +126,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         self.sampler = parameters.sampler()
         self.processor = makeLogitProcessor(parameters: parameters, model: mainModel)
-        if let suppressor = makeSuppressTokensProcessor(model: mainModel) {
+        if let suppressor = makeSuppressTokensProcessor(model: mainModel, parameters: parameters) {
             self.draftSampler = SuppressTokensSampler(base: self.sampler, suppressor: suppressor)
         } else {
             self.draftSampler = self.sampler

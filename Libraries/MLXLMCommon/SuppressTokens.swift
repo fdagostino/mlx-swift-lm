@@ -168,21 +168,31 @@ func suppressedTokenIds(for model: any LanguageModel) -> Set<Int> {
     return ids
 }
 
-/// Build the ``SuppressTokensProcessor`` for a model, or `nil` when it has
-/// no suppressed tokens.
-func makeSuppressTokensProcessor(model: any LanguageModel) -> SuppressTokensProcessor? {
-    SuppressTokensProcessor(tokenIds: suppressedTokenIds(for: model))
+/// Build the ``SuppressTokensProcessor`` for a generation run, or `nil` when
+/// nothing is suppressed. Unions three sources: the model's protocol-advertised
+/// IDs, `generation_config.json`'s `suppress_tokens` (checkpoint-level
+/// semantics), and the per-generation
+/// ``GenerateParameters/suppressedTokens`` (app-driven).
+func makeSuppressTokensProcessor(
+    model: any LanguageModel, parameters: GenerateParameters? = nil
+) -> SuppressTokensProcessor? {
+    var ids = suppressedTokenIds(for: model)
+    if let generationIds = parameters?.suppressedTokens {
+        ids.formUnion(generationIds)
+    }
+    return SuppressTokensProcessor(tokenIds: ids)
 }
 
 /// Build the ``LogitProcessor`` for a generation run: the parameter-derived
-/// penalty processor chained with a ``SuppressTokensProcessor`` when the
-/// model has suppressed token IDs (via ``SuppressedTokensProviding`` or
-/// `generation_config.json`).
+/// penalty processor chained with a ``SuppressTokensProcessor`` when any
+/// suppression source is active (``SuppressedTokensProviding``,
+/// `generation_config.json`, or ``GenerateParameters/suppressedTokens``).
 func makeLogitProcessor(
     parameters: GenerateParameters, model: any LanguageModel
 ) -> LogitProcessor? {
     let base = parameters.processor()
-    guard let suppressor = makeSuppressTokensProcessor(model: model) else {
+    guard let suppressor = makeSuppressTokensProcessor(model: model, parameters: parameters)
+    else {
         return base
     }
     guard let base else { return suppressor }

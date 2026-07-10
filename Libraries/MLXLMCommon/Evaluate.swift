@@ -114,6 +114,17 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// Token IDs that must never be sampled during this generation.
+    ///
+    /// Merged with the model's own suppressed set (``SuppressedTokensProviding``)
+    /// and `generation_config.json`'s `suppress_tokens` — this field adds
+    /// per-generation, app-driven suppression on top of those checkpoint-level
+    /// semantics (e.g. suppressing a model's thinking-channel delimiters for a
+    /// voice reply while another session of the same loaded model leaves them
+    /// free). Negative IDs are ignored; IDs beyond the model's vocabulary are
+    /// dropped at sampling time.
+    public var suppressedTokens: [Int]?
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -132,7 +143,8 @@ public struct GenerateParameters: Sendable {
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
-        seed: UInt64? = nil
+        seed: UInt64? = nil,
+        suppressedTokens: [Int]? = nil
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -152,6 +164,7 @@ public struct GenerateParameters: Sendable {
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
         self.seed = seed
+        self.suppressedTokens = suppressedTokens
     }
 
     public func sampler() -> LogitSampler {

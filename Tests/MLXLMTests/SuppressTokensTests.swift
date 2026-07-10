@@ -2,10 +2,10 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
 import MLXNN
 import XCTest
 
+@testable import MLXLMCommon
 @testable import MLXVLM
 
 /// Minimal `LanguageModel` whose logits always peak at `peakToken` with
@@ -265,6 +265,72 @@ public class SuppressTokensTests: XCTestCase {
         }
 
         XCTAssertEqual(tokens, [7, 7, 7, 7, 7])
+    }
+
+    // MARK: - Per-generation suppression (GenerateParameters.suppressedTokens)
+
+    func testGenerateParametersSuppressionAppliesWithoutModelSources() throws {
+        // App-driven suppression alone (no protocol conformance, no
+        // generation_config) must mask the requested IDs.
+        let model = PlainMockModel(peakToken: 5, runnerUpToken: 7)
+        let parameters = GenerateParameters(
+            maxTokens: 5, temperature: 0, suppressedTokens: [5])
+
+        let input = LMInput(tokens: MLXArray([1, 2, 3]))
+        var iterator = try TokenIterator(input: input, model: model, parameters: parameters)
+        var tokens = [Int]()
+        while let token = iterator.next() {
+            tokens.append(token)
+        }
+
+        XCTAssertEqual(tokens, [7, 7, 7, 7, 7])
+    }
+
+    func testGenerateParametersSuppressionUnionsWithModelSet() throws {
+        // Per-generation IDs add to the model's own set: the model
+        // suppresses the peak, the parameters suppress the runner-up, so
+        // generation lands on the third-best token.
+        let model = SuppressingMockModel(
+            peakToken: 5, runnerUpToken: 7, suppressedTokenIds: [5])
+        let parameters = GenerateParameters(
+            maxTokens: 3, temperature: 0, suppressedTokens: [7])
+
+        let tokens = try generate(model: model, parameters: parameters)
+
+        XCTAssertFalse(tokens.contains(5))
+        XCTAssertFalse(tokens.contains(7))
+    }
+
+    func testGenerateParametersSuppressionToleratesInvalidIds() throws {
+        // Negative and out-of-vocabulary IDs from the app are dropped, not
+        // crashed on — same guarantees as the checkpoint-level sources.
+        let model = PlainMockModel(peakToken: 5, runnerUpToken: 7)
+        let parameters = GenerateParameters(
+            maxTokens: 3, temperature: 0, suppressedTokens: [-1, 5, 258882])
+
+        let input = LMInput(tokens: MLXArray([1, 2, 3]))
+        var iterator = try TokenIterator(input: input, model: model, parameters: parameters)
+        var tokens = [Int]()
+        while let token = iterator.next() {
+            tokens.append(token)
+        }
+
+        XCTAssertEqual(tokens, [7, 7, 7])
+    }
+
+    func testMakeSuppressTokensProcessorUnionsParameters() throws {
+        // The MTP draft sampler is built from makeSuppressTokensProcessor —
+        // per-generation IDs must reach it too.
+        let model = PlainMockModel(peakToken: 5, runnerUpToken: 7)
+        let processor = try XCTUnwrap(
+            makeSuppressTokensProcessor(
+                model: model,
+                parameters: GenerateParameters(suppressedTokens: [3])))
+        let logits = MLXArray([0.5, 5.0, 1.0, 9.0, 2.0] as [Float])[.newAxis, .ellipsis]
+
+        let token = ArgMaxSampler().sample(logits: processor.process(logits: logits))
+
+        XCTAssertEqual(token.item(Int.self), 1)
     }
 
     // MARK: - Gemma4Unified config-derived suppressed tokens
