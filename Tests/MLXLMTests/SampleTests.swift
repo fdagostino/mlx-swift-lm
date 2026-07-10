@@ -355,4 +355,87 @@ public class SampleTests: XCTestCase {
         XCTAssertEqual(tokens.count, 8)
         for t in tokens { XCTAssertTrue((0 ..< 4).contains(t)) }
     }
+
+    // MARK: - XTC (exclude top choices)
+
+    /// Three tokens above an XTC threshold of 0.15 (0.4, 0.3, 0.2), two below.
+    private func xtcLogits() -> MLXArray {
+        log(
+            MLXArray([0.4 as Float, 0.3 as Float, 0.2 as Float, 0.06 as Float, 0.04 as Float])[
+                .newAxis, .ellipsis])
+    }
+
+    func testXTCDisabledMatchesExistingBehavior() {
+        // xtcProbability == 0 must not consume randomness or alter sampling:
+        // with the same seed, the sequences are identical to a sampler built
+        // without the XTC parameters.
+        let logits = xtcLogits()
+        func draw(sampler: TopPSampler) -> [Int] {
+            (0 ..< 24).map { _ in sampler.sample(logits: logits).item(Int.self) }
+        }
+        let baseline = draw(sampler: TopPSampler(temperature: 1.0, seed: 42))
+        let disabled = draw(
+            sampler: TopPSampler(
+                temperature: 1.0, xtcProbability: 0.0, xtcThreshold: 0.15, seed: 42))
+        XCTAssertEqual(baseline, disabled)
+    }
+
+    func testXTCMasksAllButLeastLikelyTopChoice() {
+        // With probability 1 and threshold 0.15, tokens 0 (0.4), 1 (0.3) and
+        // 2 (0.2) qualify; the two most likely are removed and token 2, the
+        // least likely qualifier, survives along with the sub-threshold tail.
+        let draws = 4000
+        let sampler = TopPSampler(temperature: 1.0, xtcProbability: 1.0, xtcThreshold: 0.15)
+        let counts = sampleCounts(sampler: sampler, logits: xtcLogits(), draws: draws)
+
+        assertOnlySampled(counts, allowedTokens: [2, 3, 4])
+        // Renormalized survivor mass: 0.2 / 0.3, 0.06 / 0.3, 0.04 / 0.3.
+        XCTAssertEqual(frequency(counts, token: 2, draws: draws), 0.6667, accuracy: 0.06)
+        XCTAssertEqual(frequency(counts, token: 3, draws: draws), 0.2, accuracy: 0.05)
+        XCTAssertEqual(frequency(counts, token: 4, draws: draws), 0.1333, accuracy: 0.05)
+    }
+
+    func testXTCIsNoOpWithFewerThanTwoTokensAboveThreshold() {
+        let draws = 4000
+
+        // Exactly one token above the threshold: it must survive.
+        let oneAbove = log(
+            MLXArray([0.9 as Float, 0.05 as Float, 0.03 as Float, 0.02 as Float])[
+                .newAxis, .ellipsis])
+        let sampler = TopPSampler(temperature: 1.0, xtcProbability: 1.0, xtcThreshold: 0.1)
+        let counts = sampleCounts(sampler: sampler, logits: oneAbove, draws: draws)
+        XCTAssertEqual(frequency(counts, token: 0, draws: draws), 0.9, accuracy: 0.05)
+
+        // No token above the threshold: the distribution is untouched.
+        let noneAbove = flatLogits()
+        let flatSampler = TopPSampler(temperature: 1.0, xtcProbability: 1.0, xtcThreshold: 0.3)
+        let flatCounts = sampleCounts(sampler: flatSampler, logits: noneAbove, draws: draws)
+        assertOnlySampled(flatCounts, allowedTokens: [0, 1, 2, 3])
+        for token in 0 ..< 4 {
+            XCTAssertEqual(frequency(flatCounts, token: token, draws: draws), 0.25, accuracy: 0.05)
+        }
+    }
+
+    func testXTCSameSeedIsReproducible() {
+        // xtcProbability 0.5 exercises the per-step random gate; the gate draw
+        // and the categorical draw both come from the seeded state.
+        let logits = xtcLogits()
+        func draw(seed: UInt64) -> [Int] {
+            let sampler = TopPSampler(
+                temperature: 1.0, xtcProbability: 0.5, xtcThreshold: 0.15, seed: seed)
+            return (0 ..< 24).map { _ in sampler.sample(logits: logits).item(Int.self) }
+        }
+        XCTAssertEqual(draw(seed: 42), draw(seed: 42))
+        XCTAssertNotEqual(draw(seed: 1), draw(seed: 2))
+    }
+
+    func testGenerateParametersCreatesXTCSampler() {
+        XCTAssertTrue(
+            GenerateParameters(temperature: 0.7, xtcProbability: 0.5).sampler() is TopPSampler)
+        XCTAssertTrue(
+            GenerateParameters(temperature: 0.7, xtcProbability: 0.0).sampler()
+                is CategoricalSampler)
+        XCTAssertTrue(
+            GenerateParameters(temperature: 0, xtcProbability: 0.5).sampler() is ArgMaxSampler)
+    }
 }

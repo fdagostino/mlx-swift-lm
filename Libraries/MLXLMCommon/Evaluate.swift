@@ -90,6 +90,15 @@ public struct GenerateParameters: Sendable {
     /// Min-p sampling threshold relative to the highest probability token (0 disables)
     public var minP: Float
 
+    /// Probability per sampling step of applying XTC (exclude top choices) sampling (0 disables)
+    public var xtcProbability: Float
+
+    /// Probability threshold for XTC sampling: on steps where XTC is applied, every token
+    /// whose probability exceeds this threshold is removed except the least likely of them.
+    /// Meaningful values are in `0 ... 0.5`; above 0.5 at most one token can qualify and
+    /// XTC never triggers.
+    public var xtcThreshold: Float
+
     /// Optional seed for reproducible sampling. When set, the sampler's RNG
     /// (`TopPSampler` / `CategoricalSampler`) is seeded deterministically, so
     /// the same `(seed, prompt, parameters)` produces the same sampled
@@ -126,6 +135,8 @@ public struct GenerateParameters: Sendable {
         topP: Float = 1.0,
         topK: Int = 0,
         minP: Float = 0.0,
+        xtcProbability: Float = 0.0,
+        xtcThreshold: Float = 0.1,
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int = 20,
         presencePenalty: Float? = nil,
@@ -145,6 +156,8 @@ public struct GenerateParameters: Sendable {
         self.topP = topP
         self.topK = topK
         self.minP = minP
+        self.xtcProbability = xtcProbability
+        self.xtcThreshold = xtcThreshold
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
         self.presencePenalty = presencePenalty
@@ -159,12 +172,14 @@ public struct GenerateParameters: Sendable {
         let usesTopP = topP > 0 && topP < 1
         let usesTopK = topK > 0
         let usesMinP = minP > 0
+        let usesXTC = xtcProbability > 0
 
         if temperature == 0 {
             return ArgMaxSampler()
-        } else if usesTopP || usesTopK || usesMinP {
+        } else if usesTopP || usesTopK || usesMinP || usesXTC {
             return TopPSampler(
-                temperature: temperature, topP: topP, topK: topK, minP: minP, seed: seed)
+                temperature: temperature, topP: topP, topK: topK, minP: minP,
+                xtcProbability: xtcProbability, xtcThreshold: xtcThreshold, seed: seed)
         } else {
             return CategoricalSampler(temperature: temperature, seed: seed)
         }
@@ -222,10 +237,10 @@ public struct ArgMaxSampler: LogitSampler {
     }
 }
 
-/// Sampler that uses probability filters (`topP`, `topK`, `minP`) and `temperature`
+/// Sampler that uses probability filters (`topP`, `topK`, `minP`, XTC) and `temperature`
 /// to sample the logits.
 ///
-/// Filters are applied in the same order as Python mlx-lm: top_p → min_p → top_k.
+/// Filters are applied in the same order as Python mlx-lm: top_p → min_p → xtc → top_k.
 /// Each filter operates on the full vocabulary in original token order, masking
 /// rejected tokens with `-inf`. This matches the composable filter chain in
 /// `mlx_lm.sample_utils.make_sampler`.
@@ -234,11 +249,13 @@ public struct TopPSampler: LogitSampler {
     let topP: MLXArray?
     let topK: Int?
     let minP: MLXArray?
+    let xtc: (probability: MLXArray, threshold: MLXArray)?
     let negInf: MLXArray
     let randomState: MLXRandom.RandomState
 
     public init(
         temperature: Float, topP: Float = 1.0, topK: Int = 0, minP: Float = 0.0,
+        xtcProbability: Float = 0.0, xtcThreshold: Float = 0.1,
         seed: UInt64? = nil
     ) {
         self.temp = MLXArray(temperature)
@@ -249,6 +266,11 @@ public struct TopPSampler: LogitSampler {
         }
         self.topK = topK > 0 ? topK : nil
         self.minP = minP > 0 ? MLXArray(minP) : nil
+        if xtcProbability > 0 {
+            self.xtc = (probability: MLXArray(xtcProbability), threshold: MLXArray(xtcThreshold))
+        } else {
+            self.xtc = nil
+        }
         self.negInf = MLXArray(-Float.infinity)
         // A seed makes sampling reproducible; nil keeps the prior
         // entropy-seeded behavior.
@@ -264,12 +286,16 @@ public struct TopPSampler: LogitSampler {
         return withRandomState(randomState) {
             var logprobs = logSoftmax(logits)
 
-            // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
+            // Apply filters in Python mlx-lm order: top_p → min_p → xtc → top_k.
             if let topP {
                 logprobs = applyTopP(logprobs, topP: topP)
             }
             if let minP {
                 logprobs = applyMinP(logprobs, minP: minP)
+            }
+            if let xtc {
+                logprobs = applyXTC(
+                    logprobs, probability: xtc.probability, threshold: xtc.threshold)
             }
             if let topK {
                 logprobs = applyTopK(logprobs, topK: topK)
@@ -299,6 +325,29 @@ public struct TopPSampler: LogitSampler {
         let maxLogprob = logprobs.max(axis: -1, keepDims: true)
         let threshold = maxLogprob + log(minP)
         return MLX.where(logprobs .>= threshold, logprobs, negInf)
+    }
+
+    /// With probability `probability` per step, remove every token whose probability
+    /// exceeds `threshold` except the least likely of them, steering sampling away from
+    /// the model's top choices while always keeping at least one viable token. A no-op
+    /// when fewer than two tokens exceed the threshold.
+    /// Matches `apply_xtc` from `mlx_lm/sample_utils.py`.
+    private func applyXTC(_ logprobs: MLXArray, probability: MLXArray, threshold: MLXArray)
+        -> MLXArray
+    {
+        let probs = softmax(logprobs, axis: -1)
+        // Probability of the least likely token above the threshold; +inf when none
+        // qualify, so the mask below is empty. A single qualifier never exceeds its
+        // own probability, so it survives too.
+        let minAboveThreshold = MLX.where(probs .> threshold, probs, MLXArray(Float.infinity))
+            .min(axis: -1, keepDims: true)
+        let mask = probs .> minAboveThreshold
+        // Random gate: apply XTC on this step with probability `probability`. The
+        // uniform draw uses the ambient (possibly seeded) random state.
+        return MLX.where(
+            uniform(0 ..< 1) .> probability,
+            logprobs,
+            MLX.where(mask, negInf, logprobs))
     }
 
     /// Keep only the top-k highest-probability tokens.
