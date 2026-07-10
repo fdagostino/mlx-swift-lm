@@ -220,6 +220,17 @@ public final class ChatSession {
     /// mid-transcript, so it is stripped. On by default.
     public var stripsContinuationBOS: Bool = true
 
+    /// Test-only: snapshot of the stored KV cache as (type name, offset) per
+    /// layer, or `nil` if the session has no materialized cache yet. Lets
+    /// tests assert that element replacements made during generation (e.g.
+    /// KV-cache quantization) are visible in the session's own storage.
+    func kvCacheSnapshot() async -> [(type: String, offset: Int)]? {
+        await cache.read { cache in
+            guard case .kvcache(let kvCache, _) = cache else { return nil }
+            return kvCache.map { (String(describing: Swift.type(of: $0)), $0.offset) }
+        }
+    }
+
     /// Initialize the `ChatSession`.
     ///
     /// - Parameters:

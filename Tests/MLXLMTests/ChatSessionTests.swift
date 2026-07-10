@@ -86,6 +86,36 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertGreaterThan(result2.count, targetLength, result2)
     }
 
+    func testKVQuantizationReplacementsSurviveAcrossTurns() async throws {
+        // Regression for the #312 value-type bug: with kvBits set, the
+        // iterator replaces KVCacheSimple elements with QuantizedKVCache.
+        // The session must adopt those replacements in its own stored
+        // cache — otherwise every token generated after the swap is lost
+        // and the next turn continues from a stale prefix.
+        let model = model()
+        let session = ChatSession(
+            model,
+            generateParameters: GenerateParameters(maxTokens: 8, kvBits: 8))
+
+        _ = try await session.respond(to: "hello")
+
+        let maybeSnapshot = await session.kvCacheSnapshot()
+        let snapshot = try XCTUnwrap(maybeSnapshot)
+        XCTAssertTrue(
+            snapshot.contains { $0.type.contains("Quantized") },
+            "session cache should hold the quantized replacements, got \(snapshot.map(\.type))")
+        let offsetAfterFirstTurn = snapshot.map(\.offset).max() ?? 0
+        XCTAssertGreaterThan(offsetAfterFirstTurn, 0)
+
+        _ = try await session.respond(to: "hello again")
+
+        let maybeSecondSnapshot = await session.kvCacheSnapshot()
+        let snapshotAfterSecondTurn = try XCTUnwrap(maybeSecondSnapshot)
+        XCTAssertGreaterThan(
+            snapshotAfterSecondTurn.map(\.offset).max() ?? 0, offsetAfterFirstTurn,
+            "second turn should extend the same transcript, not restart from a stale prefix")
+    }
+
     func testChatSessionAsync() async throws {
         let model = model()
         let session = ChatSession(model, generateParameters: generationParameters)
