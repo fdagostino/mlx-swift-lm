@@ -123,7 +123,8 @@ public struct GenerationComponents: Sendable {
     }
 
     /// As ``logitProcessor(parameters:)``, additionally masking the token ids
-    /// the model declares through ``SuppressedTokensProviding``.
+    /// the model suppresses -- declared through ``SuppressedTokensProviding``
+    /// or read from its `generation_config.json`.
     ///
     /// Suppression runs last so that no processor composed before it can
     /// reintroduce a masked id -- for multimodal placeholder tokens, emitting
@@ -132,9 +133,7 @@ public struct GenerationComponents: Sendable {
         parameters: GenerateParameters, model: any LanguageModel
     ) -> LogitProcessor? {
         let base = logitProcessor(parameters: parameters)
-        guard let provider = model as? SuppressedTokensProviding,
-            let suppressor = SuppressTokensProcessor(tokenIds: provider.suppressedTokenIds)
-        else {
+        guard let suppressor = makeSuppressTokensProcessor(model: model) else {
             return base
         }
         guard let base else { return suppressor }
