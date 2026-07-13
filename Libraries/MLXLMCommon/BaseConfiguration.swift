@@ -87,7 +87,16 @@ public struct BaseConfiguration: Codable, Sendable {
         /// - Parameter layer: The path/name of the layer.
         /// - Returns: The `Quantization` settings to apply, or `nil` if the layer should be skipped.
         public func quantization(layer: String) -> Quantization? {
-            if let perLayer = perLayerQuantization[layer] {
+            let gemma4PythonPrefix = "model.language_model."
+            let gemma4SwiftPrefix = "language_model.model."
+            let gemma4Alias = layer.hasPrefix(gemma4SwiftPrefix)
+                ? gemma4PythonPrefix + layer.dropFirst(gemma4SwiftPrefix.count)
+                : nil
+
+            let perLayer = perLayerQuantization[layer]
+                ?? gemma4Alias.flatMap { perLayerQuantization[String($0)] }
+
+            if let perLayer {
                 switch perLayer {
                 case .skip:
                     return nil

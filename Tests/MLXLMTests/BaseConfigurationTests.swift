@@ -67,4 +67,29 @@ public class BaseConfigurationTests: XCTestCase {
             .init(groupSize: 64, bits: 4))
     }
 
+    func testGemma4PythonQuantizationPathResolvesSwiftModulePath() throws {
+        let json =
+            """
+            {
+                "model_type": "gemma4_unified",
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.language_model.layers.0.self_attn.k_proj": {
+                        "group_size": 64,
+                        "bits": 5
+                    }
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(
+            config.perLayerQuantization?.quantization(
+                layer: "language_model.model.layers.0.self_attn.k_proj"),
+            .init(groupSize: 64, bits: 5))
+    }
+
 }
