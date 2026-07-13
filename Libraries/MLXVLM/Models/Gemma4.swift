@@ -6,6 +6,26 @@ import MLXNN
 
 // Based on https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/gemma4
 
+// MARK: - Compiled fusion fragments
+//
+// Mirrors the upstream MLXLLM/Gemma4Text optimization (ml-explore PR #249):
+// fuse residual + RMSNorm and gelu + multiply into shapeless compiled graphs.
+// This reduces per-token MLX dispatch overhead on the Gemma 4 VLM path.
+
+private let kGemma4RMSEps: Float = 1e-6
+
+private let _gemma4AddRMSNorm: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { residual, x, weight in
+    residual + MLXFast.rmsNorm(x, weight: weight, eps: kGemma4RMSEps)
+}
+
+private let _gemma4GeluMul: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { gate, other in
+    geluApproximate(gate) * other
+}
+
 private enum Gemma4Error: LocalizedError {
     case imageTokenCountMismatch(expectedVisionTokens: Int, actualPromptTokens: Int)
     case multimodalTokenCountMismatch(kind: String, featureTokens: Int, promptTokens: Int)
@@ -1007,6 +1027,13 @@ final class Gemma4TextDecoderLayer: Module {
     @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
 
     init(config: Gemma4TextConfiguration, layerIdx: Int, kvSharedOnly: Bool = false) {
+        // The fused graph bakes the RMS epsilon into one shapeless compiled
+        // instance. Fail loudly if a future checkpoint changes that invariant.
+        precondition(
+            config.rmsNormEps == kGemma4RMSEps,
+            "Gemma4 fused decode path requires rmsNormEps == \(kGemma4RMSEps), got \(config.rmsNormEps)"
+        )
+
         self.layerType = config.layerTypes[layerIdx]
         self.enableMoE = config.enableMoEBlock
         self._selfAttention.wrappedValue = Gemma4TextAttention(
@@ -1054,9 +1081,7 @@ final class Gemma4TextDecoderLayer: Module {
         var h = inputLayerNorm(x)
         let (attentionOutput, kvState, attentionOffset) = selfAttention(
             h, mask: mask, cache: cache, sharedKV: sharedKV, offset: offset)
-        h = attentionOutput
-        h = postAttentionLayerNorm(h)
-        h = residual + h
+        h = _gemma4AddRMSNorm(residual, attentionOutput, postAttentionLayerNorm.weight)
 
         residual = h
         if enableMoE,
@@ -1080,19 +1105,16 @@ final class Gemma4TextDecoderLayer: Module {
             h = preFeedforwardLayerNorm(h)
             h = mlp(h)
         }
-        h = postFeedforwardLayerNorm(h)
-        h = residual + h
+        h = _gemma4AddRMSNorm(residual, h, postFeedforwardLayerNorm.weight)
 
         if let perLayerInputGate, let perLayerProjection, let postPerLayerInputNorm,
             let perLayerInput
         {
             residual = h
             var gated = perLayerInputGate(h)
-            gated = geluApproximate(gated)
-            gated = gated * perLayerInput
+            gated = _gemma4GeluMul(gated, perLayerInput)
             gated = perLayerProjection(gated)
-            gated = postPerLayerInputNorm(gated)
-            h = residual + gated
+            h = _gemma4AddRMSNorm(residual, gated, postPerLayerInputNorm.weight)
         }
 
         return (h * layerScalar, kvState, attentionOffset)
