@@ -77,9 +77,16 @@ private final class CyclicTransitionLanguageModel: Module, LanguageModel,
     /// tests can exercise the untrimmable-after-wrap fallback.
     var rotatingCacheMaxSize: Int?
 
-    init(vocabularySize: Int, rotatingCacheMaxSize: Int? = nil) {
+    /// When true, `prepare` evaluates the whole prompt itself and returns
+    /// `.logits` instead of handing the tokens back to the iterator.
+    let prefillReturnsLogits: Bool
+
+    init(
+        vocabularySize: Int, rotatingCacheMaxSize: Int? = nil, prefillReturnsLogits: Bool = false
+    ) {
         self.vocabularySize = vocabularySize
         self.rotatingCacheMaxSize = rotatingCacheMaxSize
+        self.prefillReturnsLogits = prefillReturnsLogits
         super.init()
     }
 
@@ -93,7 +100,9 @@ private final class CyclicTransitionLanguageModel: Module, LanguageModel,
     func prepare(_ input: LMInput, cache: [KVCache], state _: LMOutput.State?, windowSize: Int?)
         throws -> PrepareResult
     {
-        .tokens(input.text)
+        guard prefillReturnsLogits else { return .tokens(input.text) }
+        let logits = callAsFunction(input.text.tokens[.newAxis], cache: cache)
+        return .logits(LMOutput(logits: logits))
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -163,6 +172,31 @@ private func drain(_ iterator: inout some TokenIteratorProtocol) -> [Int] {
     let plainTokens = drain(&plain)
 
     let pldModel = CyclicTransitionLanguageModel(vocabularySize: 8, rotatingCacheMaxSize: 16)
+    var pld = try PromptLookupTokenIterator(
+        input: prompt, model: pldModel, parameters: parameters,
+        numDraftTokens: 6, maxNGramLength: 3, minNGramLength: 1)
+    let pldTokens = drain(&pld)
+
+    #expect(pldTokens == plainTokens)
+}
+
+@Test func promptLookupEmitsThePrefillTokenWhenPrepareReturnsLogits() throws {
+    // A model whose `prepare` evaluates the final prompt position itself
+    // hands back `.logits`, and the token sampled from them is already the
+    // first generated token. It must reach the consumer and the n-gram
+    // corpus: dropping it starts the stream one position ahead of plain
+    // generation.
+    let parameters = GenerateParameters(maxTokens: 40, temperature: 0)
+    let prompt = LMInput(tokens: MLXArray([0, 1, 2]))
+
+    let plainModel = CyclicTransitionLanguageModel(
+        vocabularySize: 8, prefillReturnsLogits: true)
+    var plain = try TokenIterator(
+        input: prompt, model: plainModel, parameters: parameters)
+    let plainTokens = drain(&plain)
+
+    let pldModel = CyclicTransitionLanguageModel(
+        vocabularySize: 8, prefillReturnsLogits: true)
     var pld = try PromptLookupTokenIterator(
         input: prompt, model: pldModel, parameters: parameters,
         numDraftTokens: 6, maxNGramLength: 3, minNGramLength: 1)

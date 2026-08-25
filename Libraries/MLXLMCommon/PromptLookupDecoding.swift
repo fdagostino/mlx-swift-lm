@@ -178,12 +178,23 @@ public struct PromptLookupTokenIterator: TokenIteratorProtocol {
         case .tokens(let tokens):
             y = tokens
         case .logits(let result):
+            // `prepare` evaluated the final prompt position itself, so this
+            // sample is already the first *generated* token -- not a prompt
+            // token still to be forwarded, as in the `.tokens` case above.
+            // It has to be emitted and enter the lookup corpus here: `y`
+            // alone only carries it into the next forward pass, which would
+            // start the stream one position ahead of an equivalent
+            // autoregressive run and hide the token from n-gram matching.
             var logits = result.logits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
             processor?.didSample(token: token)
             y = .init(tokens: token)
             state = result.state
+
+            let tokenValue = token.item(Int.self)
+            pendingTokens.append(tokenValue)
+            history.append(tokenValue)
         }
     }
 
