@@ -97,9 +97,9 @@ private final class CyclicTransitionLanguageModel: Module, LanguageModel,
         return [KVCacheSimple()]
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], state _: LMOutput.State?, windowSize: Int?)
-        throws -> PrepareResult
-    {
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill _: PrefillParameters
+    ) throws -> PrepareResult {
         guard prefillReturnsLogits else { return .tokens(input.text) }
         let logits = callAsFunction(input.text.tokens[.newAxis], cache: cache)
         return .logits(LMOutput(logits: logits))

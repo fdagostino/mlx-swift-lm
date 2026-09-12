@@ -76,7 +76,7 @@ public struct PromptLookupTokenIterator: TokenIteratorProtocol {
     var y: LMInput.Text
     let model: any LanguageModel
 
-    var state: LMOutput.State?
+    public var state: LMOutput.State?
     var cache: [KVCache]
     let quantizeKVCache: (inout [KVCache]) -> Void
 
@@ -140,7 +140,7 @@ public struct PromptLookupTokenIterator: TokenIteratorProtocol {
         self.y = input.text
         self.model = model
 
-        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.cache = try cache ?? model.newCache(parameters: parameters)
         guard canTrimPromptCache(self.cache) else {
             throw KVCacheError(
                 message: "Prompt-lookup decoding requires a trimmable KV cache.")
